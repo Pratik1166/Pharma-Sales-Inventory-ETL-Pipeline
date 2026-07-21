@@ -1,0 +1,204 @@
+-- ============================================================
+-- schema.sql — Pharma Data Warehouse Star Schema
+-- Database: PostgreSQL 14
+-- Run: psql -U etl_user -d pharma_dw -f sql/schema.sql
+-- ============================================================
+
+-- ── Extensions ──────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ── Drop existing tables (for fresh setup) ──────────────────
+DROP TABLE IF EXISTS fact_inventory CASCADE;
+DROP TABLE IF EXISTS fact_sales     CASCADE;
+DROP TABLE IF EXISTS dim_warehouse  CASCADE;
+DROP TABLE IF EXISTS dim_date       CASCADE;
+DROP TABLE IF EXISTS dim_region     CASCADE;
+DROP TABLE IF EXISTS dim_product    CASCADE;
+
+
+-- ============================================================
+-- DIMENSIONS
+-- ============================================================
+
+CREATE TABLE dim_product (
+    product_id          VARCHAR(20)     PRIMARY KEY,
+    brand_name          VARCHAR(100),
+    generic_name        VARCHAR(150),
+    therapeutic_class   VARCHAR(100),
+    manufacturer        VARCHAR(100),
+    unit_cost           NUMERIC(10, 2),
+    unit_of_measure     VARCHAR(30),
+    schedule            VARCHAR(10),        -- e.g. H, H1, X (controlled)
+    created_at          TIMESTAMP           DEFAULT NOW(),
+    updated_at          TIMESTAMP           DEFAULT NOW()
+);
+CREATE INDEX idx_dim_product_class ON dim_product(therapeutic_class);
+CREATE INDEX idx_dim_product_mfr   ON dim_product(manufacturer);
+
+
+CREATE TABLE dim_region (
+    region_id           SERIAL          PRIMARY KEY,
+    region_name         VARCHAR(50)     NOT NULL UNIQUE,
+    territory_manager   VARCHAR(100),
+    zone                VARCHAR(50),
+    created_at          TIMESTAMP           DEFAULT NOW()
+);
+
+
+CREATE TABLE dim_date (
+    date_id             INT             PRIMARY KEY,   -- YYYYMMDD format
+    date                DATE            NOT NULL UNIQUE,
+    day                 SMALLINT,
+    week                SMALLINT,
+    month               SMALLINT,
+    month_name          VARCHAR(10),
+    quarter             SMALLINT,
+    year                SMALLINT,
+    is_weekend          BOOLEAN         DEFAULT FALSE
+);
+CREATE INDEX idx_dim_date_year_month ON dim_date(year, month);
+
+
+CREATE TABLE dim_warehouse (
+    warehouse_id        VARCHAR(30)     PRIMARY KEY,
+    warehouse_name      VARCHAR(100),
+    city                VARCHAR(50),
+    region_name         VARCHAR(50),
+    temp_min_c          NUMERIC(5, 1),
+    temp_max_c          NUMERIC(5, 1),
+    cold_chain_required BOOLEAN         DEFAULT FALSE,
+    capacity_units      INT,
+    created_at          TIMESTAMP           DEFAULT NOW()
+);
+
+
+-- ============================================================
+-- FACTS
+-- ============================================================
+
+CREATE TABLE fact_sales (
+    transaction_id      VARCHAR(20)     PRIMARY KEY,
+    rep_id              VARCHAR(20),
+    product_id          VARCHAR(20)     REFERENCES dim_product(product_id),
+    region              VARCHAR(50),
+    date_id             INT             REFERENCES dim_date(date_id),
+    sale_date           DATE,
+    units_sold          INT,
+    unit_price          NUMERIC(10, 2),
+    discount_pct        NUMERIC(5, 4)   DEFAULT 0,
+    discount_amount     NUMERIC(12, 2),
+    revenue             NUMERIC(14, 2),
+    sale_month          VARCHAR(7),     -- YYYY-MM
+    sale_year           SMALLINT,
+    hospital_name       VARCHAR(150),
+    loaded_at           TIMESTAMP           DEFAULT NOW()
+);
+CREATE INDEX idx_fact_sales_product    ON fact_sales(product_id);
+CREATE INDEX idx_fact_sales_date       ON fact_sales(sale_date);
+CREATE INDEX idx_fact_sales_region     ON fact_sales(region);
+CREATE INDEX idx_fact_sales_rep        ON fact_sales(rep_id);
+CREATE INDEX idx_fact_sales_month_year ON fact_sales(sale_year, sale_month);
+
+
+CREATE TABLE fact_inventory (
+    id                      SERIAL          PRIMARY KEY,
+    product_id              VARCHAR(20)     REFERENCES dim_product(product_id),
+    warehouse_id            VARCHAR(30)     REFERENCES dim_warehouse(warehouse_id),
+    batch_number            VARCHAR(30),
+    snapshot_date           DATE            NOT NULL DEFAULT CURRENT_DATE,
+    quantity_on_hand        INT,
+    reorder_threshold       INT,
+    reorder_quantity        INT,
+    avg_daily_units_sold    NUMERIC(8, 2),
+    days_of_stock_computed  NUMERIC(6, 1),
+    stockout_risk_computed  BOOLEAN         DEFAULT FALSE,
+    cold_chain_required     BOOLEAN         DEFAULT FALSE,
+    expiry_date             DATE,
+    last_updated            TIMESTAMP,
+    extracted_at            TIMESTAMP,
+    loaded_at               TIMESTAMP           DEFAULT NOW(),
+    UNIQUE (product_id, warehouse_id, snapshot_date)
+);
+CREATE INDEX idx_inv_product       ON fact_inventory(product_id);
+CREATE INDEX idx_inv_snapshot      ON fact_inventory(snapshot_date);
+CREATE INDEX idx_inv_stockout      ON fact_inventory(stockout_risk_computed) WHERE stockout_risk_computed = TRUE;
+CREATE INDEX idx_inv_expiry        ON fact_inventory(expiry_date);
+
+
+-- ============================================================
+-- ANALYTICAL VIEWS
+-- ============================================================
+
+-- Revenue by therapeutic class
+CREATE OR REPLACE VIEW vw_revenue_by_class AS
+SELECT
+    p.therapeutic_class,
+    s.sale_year,
+    s.sale_month,
+    SUM(s.revenue)      AS total_revenue,
+    SUM(s.units_sold)   AS total_units,
+    COUNT(*)            AS transaction_count,
+    AVG(s.discount_pct) AS avg_discount_pct
+FROM fact_sales s
+JOIN dim_product p ON s.product_id = p.product_id
+GROUP BY p.therapeutic_class, s.sale_year, s.sale_month;
+
+
+-- Stockout risk dashboard
+CREATE OR REPLACE VIEW vw_stockout_risk AS
+SELECT
+    i.product_id,
+    p.brand_name,
+    p.therapeutic_class,
+    i.warehouse_id,
+    i.quantity_on_hand,
+    i.days_of_stock_computed,
+    i.reorder_threshold,
+    i.cold_chain_required,
+    i.expiry_date,
+    CASE
+        WHEN i.days_of_stock_computed < 7   THEN 'CRITICAL'
+        WHEN i.days_of_stock_computed < 14  THEN 'HIGH'
+        WHEN i.days_of_stock_computed < 30  THEN 'MEDIUM'
+        ELSE 'LOW'
+    END AS risk_level
+FROM fact_inventory i
+JOIN dim_product p ON i.product_id = p.product_id
+WHERE i.snapshot_date = CURRENT_DATE
+ORDER BY i.days_of_stock_computed ASC NULLS LAST;
+
+
+-- Top reps by gross revenue (monthly)
+CREATE OR REPLACE VIEW vw_top_reps_monthly AS
+SELECT
+    rep_id,
+    sale_year,
+    sale_month,
+    SUM(revenue)    AS total_revenue,
+    SUM(units_sold) AS total_units,
+    COUNT(*)        AS transactions,
+    RANK() OVER (
+        PARTITION BY sale_year, sale_month
+        ORDER BY SUM(revenue) DESC
+    ) AS revenue_rank
+FROM fact_sales
+GROUP BY rep_id, sale_year, sale_month;
+
+
+-- Products expiring within 90 days
+CREATE OR REPLACE VIEW vw_expiring_soon AS
+SELECT
+    i.product_id,
+    p.brand_name,
+    p.generic_name,
+    i.warehouse_id,
+    i.batch_number,
+    i.expiry_date,
+    i.quantity_on_hand,
+    (i.expiry_date - CURRENT_DATE) AS days_to_expiry
+FROM fact_inventory i
+JOIN dim_product p ON i.product_id = p.product_id
+WHERE i.snapshot_date = CURRENT_DATE
+  AND i.expiry_date IS NOT NULL
+  AND i.expiry_date <= CURRENT_DATE + INTERVAL '90 days'
+ORDER BY i.expiry_date ASC;
